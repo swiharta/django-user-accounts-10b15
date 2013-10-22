@@ -1,6 +1,7 @@
 from __future__ import unicode_literals
+import json
 
-from django.http import Http404, HttpResponseForbidden
+from django.http import Http404, HttpResponseForbidden, HttpResponse, HttpResponseBadRequest
 from django.core.mail import send_mail
 from django.shortcuts import redirect, get_object_or_404
 from django.utils.http import base36_to_int, int_to_base36
@@ -25,7 +26,88 @@ from account.models import SignupCode, EmailAddress, EmailConfirmation, Account,
 from account.utils import default_redirect, user_display
 
 
-class SignupView(FormView):
+class BootstrapAjaxFormView(FormView):
+  '''
+  Handles AJAX forms when used with bootstrap-ajax.js
+  '''
+  ajax_redirect = False
+
+  def get(self, request, *args, **kwargs):
+    form_class = self.get_form_class()
+    form = self.get_form(form_class)
+    data = self.get_ajax_html(form)
+    if data:
+      return HttpResponse(json.dumps(data), mimetype="application/json")
+    return self.render_to_response(self.get_context_data(form=form))
+
+  def form_valid(self, form):
+    if self.ajax_redirect:
+      data = self.get_ajax_redirect(form)
+    else:
+      data = self.get_ajax_html(form)
+    if data:
+      return HttpResponse(json.dumps(data), mimetype="application/json")
+    return redirect(self.get_success_url()) ## this is all the parent form_valid() does
+
+  def form_invalid(self, form):
+    data = self.get_ajax_html(form)
+    if data:
+      # TODO: eldarion-ajax.js doesn't support returning a meaningful 400 response yet
+      # return HttpResponseBadRequest(json.dumps(data), mimetype="application/json")
+      return HttpResponse(json.dumps(data), mimetype="application/json")
+    return self.render_to_response(self.get_context_data(form=form)) ## this is all the parent form_invalid() does
+
+  def get_ajax_html(self, form):
+    if self.request.is_ajax():
+      data = {
+        "html": render_to_string(
+          self.template_name,
+          self.get_context_data(form=form, request=self.request)
+        )
+      }
+      fragments = self.get_fragments()
+      if fragments:
+        data['fragments'] = fragments
+      return data
+    else:
+      return None
+
+  def get_ajax_redirect(self, form):
+    if self.request.is_ajax():
+      data = {"location": self.get_success_url()}
+      return data
+    else:
+      return None
+
+  def get_fragments(self):
+    return None
+
+
+class BootstrapAjaxTemplateView(TemplateResponseMixin, View):
+
+  ajax_redirect = False
+
+  def get(self, *args, **kwargs):
+    ctx = self.get_context_data(request=self.request) # need request to use is_ajax() in base template
+    if self.request.is_ajax():
+      data = {
+        "html": render_to_string(self.template_name, ctx)
+      }
+      return HttpResponse(json.dumps(data), mimetype="application/json")
+    return self.render_to_response(ctx)
+
+  def post(self, *args, **kwargs):
+    if self.request.is_ajax():
+      # data = {"location": self.get_success_url()}
+      data = {"location": "/"}
+      return HttpResponse(json.dumps(data), mimetype="application/json")
+    return redirect(self.get_redirect_url())
+
+  def get_context_data(self, **kwargs):
+    return kwargs
+
+
+class SignupView(BootstrapAjaxFormView):
 
     template_name = "account/signup.html"
     template_name_ajax = "account/ajax/signup.html"
@@ -36,6 +118,7 @@ class SignupView(FormView):
     form_class = SignupForm
     form_kwargs = {}
     redirect_field_name = "next"
+    ajax_redirect = True
     messages = {
         "email_confirmation_sent": {
             "level": messages.INFO,
@@ -132,7 +215,7 @@ class SignupView(FormView):
                     })
                 )
             self.login_user()
-        return redirect(self.get_success_url())
+        return super(SignupView, self).form_valid(form)
 
     def get_success_url(self, fallback_url=None, **kwargs):
         if fallback_url is None:
@@ -230,13 +313,14 @@ class SignupView(FormView):
         return self.response_class(**response_kwargs)
 
 
-class LoginView(FormView):
+class LoginView(BootstrapAjaxFormView):
 
     template_name = "account/login.html"
     template_name_ajax = "account/ajax/login.html"
     form_class = LoginUsernameForm
     form_kwargs = {}
     redirect_field_name = "next"
+    ajax_redirect = True
 
     def get(self, *args, **kwargs):
         if self.request.user.is_authenticated():
@@ -274,7 +358,7 @@ class LoginView(FormView):
     def form_valid(self, form):
         self.login_user(form)
         self.after_login(form)
-        return redirect(self.get_success_url())
+        return super(LoginView, self).form_valid(form)
 
     def after_login(self, form):
         signals.user_logged_in.send(sender=LoginView, user=form.user, form=form)
@@ -294,21 +378,22 @@ class LoginView(FormView):
         self.request.session.set_expiry(expiry)
 
 
-class LogoutView(TemplateResponseMixin, View):
+class LogoutView(BootstrapAjaxTemplateView):
 
     template_name = "account/logout.html"
     redirect_field_name = "next"
+    ajax_redirect = True
 
     def get(self, *args, **kwargs):
         if not self.request.user.is_authenticated():
             return redirect(self.get_redirect_url())
         ctx = self.get_context_data()
-        return self.render_to_response(ctx)
+        return super(LogoutView, self).get(*args, **kwargs)
 
     def post(self, *args, **kwargs):
         if self.request.user.is_authenticated():
             auth.logout(self.request)
-        return redirect(self.get_redirect_url())
+        return super(LogoutView, self).post(*args, **kwargs)
 
     def get_context_data(self, **kwargs):
         ctx = kwargs
@@ -615,7 +700,7 @@ class PasswordResetTokenView(FormView):
         return self.response_class(**response_kwargs)
 
 
-class SettingsView(LoginRequiredMixin, FormView):
+class SettingsView(LoginRequiredMixin, BootstrapAjaxFormView):
 
     template_name = "account/settings.html"
     form_class = SettingsForm
@@ -650,7 +735,7 @@ class SettingsView(LoginRequiredMixin, FormView):
                 self.messages["settings_updated"]["level"],
                 self.messages["settings_updated"]["text"]
             )
-        return redirect(self.get_success_url())
+        return super(SettingsView, self).form_valid(form)
 
     def update_settings(self, form):
         self.update_email(form)
